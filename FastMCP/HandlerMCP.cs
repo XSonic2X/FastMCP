@@ -120,7 +120,6 @@ public static partial class HandlerMCP
 
     private static void ProcessRequestSpan(ReadOnlySpan<byte> jsonBytes, Utf8JsonWriter writer, Stream stdout)
     {
-        // СБРАСЫВАЕМ СОСТОЯНИЕ ПИСАТЕЛЯ ДЛЯ НОВОГО JSON-ДОКУМЕНТА
         writer.Reset(stdout);
 
         JsonElement id = default;
@@ -130,8 +129,7 @@ public static partial class HandlerMCP
             using var doc = JsonDocument.ParseValue(ref reader);
             JsonElement root = doc.RootElement;
 
-            // Если это уведомление (notification) без id — просто игнорируем
-            if (!root.TryGetProperty("id"u8, out id) || id.ValueKind == JsonValueKind.Undefined)
+            if (!root.TryGetProperty("id"u8, out id) || id.ValueKind is JsonValueKind.Undefined)
                 return;
 
             if (!root.TryGetProperty("method"u8, out JsonElement methodEl))
@@ -147,18 +145,14 @@ public static partial class HandlerMCP
                 ToolsCall(id, paramsEl, writer);
             }
             else
-            {
                 WriteErrorResponse(writer, id, "Метод не найден.", -32601);
-            }
 
-            // Смываем JSON, добавляем перенос строки \n и сбрасываем поток ОС
             writer.Flush();
             stdout.WriteByte((byte)'\n');
             stdout.Flush();
         }
         catch (Exception ex)
         {
-            // Сбрасываем писатель перед отправкой ошибки, если упали во время записи
             writer.Reset(stdout);
             WriteErrorResponse(writer, id, ex.Message, -32602);
             writer.Flush();
@@ -169,7 +163,7 @@ public static partial class HandlerMCP
 
     private static void ToolsCall(JsonElement id, JsonElement paramsEl, Utf8JsonWriter writer)
     {
-        if (paramsEl.ValueKind != JsonValueKind.Object || !paramsEl.TryGetProperty("name"u8, out var toolNameElement))
+        if (paramsEl.ValueKind is not JsonValueKind.Object || !paramsEl.TryGetProperty("name"u8, out var toolNameElement))
         {
             WriteErrorResponse(writer, id, "Нет названия инструмента.");
             return;
@@ -258,7 +252,7 @@ public static partial class HandlerMCP
         writer.WriteStartObject();
         writer.WriteString("jsonrpc"u8, "2.0"u8);
         writer.WritePropertyName("id"u8);
-        if (id.ValueKind == JsonValueKind.Undefined)
+        if (id.ValueKind is JsonValueKind.Undefined)
             writer.WriteNullValue();
         else
             id.WriteTo(writer);
