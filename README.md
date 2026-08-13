@@ -1,8 +1,75 @@
 # FastMCP
 
-Синхронный C#-класс для создания серверов по протоколу Model Context Protocol (MCP) over Stdio.
+**Самый быстрый способ создать MCP-сервер на C#.**  
+Никаких зависимостей, сложных настроек или асинхронности. Просто напишите функции и запустите.
 
 ## Быстрый старт
+
+Весь сервер описывается в 3 шага:
+1. Опишите функции-обработчики.
+2. Зарегистрируйте их (3 строки кода).
+3. Запустите сервер (1 строка кода).
+
+## Примеры использования
+
+### Простой инструмент без аргументов
+
+Верните строку — сервер сам обернёт её в правильный JSON-ответ.
+
+```csharp
+// Регистрация
+HandlerMCP.CreateEmpty(GetTime, "GetTime", "Текущее время сервера");
+
+// Реализация
+static ToolResult GetTime(JsonElement id, JsonElement args) 
+    => DateTime.Now.ToString("HH:mm:ss");
+```
+
+### Инструмент с аргументами и валидацией
+
+Принимайте аргументы и возвращайте понятные ошибки для LLM через `ToolResult.Error`.
+
+```csharp
+// Регистрация: указываем имена и типы параметров
+HandlerMCP.Create(Add, "Add", "Сложение двух чисел",
+    ("a", HandlerMCP.Types.Integer.Str()),
+    ("b", HandlerMCP.Types.Integer.Str())
+);
+
+// Реализация
+static ToolResult Add(JsonElement id, JsonElement args)
+{
+    if (!args.TryGetProperty("a", out var a) || a.ValueKind != JsonValueKind.Number)
+        return ToolResult.Error("Параметр 'a' должен быть числом.");
+    
+    if (!args.TryGetProperty("b", out var b) || b.ValueKind != JsonValueKind.Number)
+        return ToolResult.Error("Параметр 'b' должен быть числом.");
+
+    return (a.GetInt32() + b.GetInt32()).ToString();
+}
+```
+
+### Работа со списками
+
+Обрабатывайте массивы данных через `CreateList`.
+
+```csharp
+// Регистрация: указываем имя свойства-массива ("items") и структуру элемента
+HandlerMCP.CreateList(ProcessBatch, "Batch", "Обработка списка", "items",
+    ("id", HandlerMCP.Types.Integer.Str())
+);
+
+// Реализация
+static ToolResult ProcessBatch(JsonElement id, JsonElement args)
+{
+    if (!args.TryGetProperty("items", out var items) || items.ValueKind != JsonValueKind.Array)
+        return ToolResult.Error("Ожидается массив 'items'.");
+
+    return $"Обработано {items.GetArrayLength()} элементов.";
+}
+```
+
+### Полный пример запуска (Program.cs)
 
 ```csharp
 using System;
@@ -12,120 +79,68 @@ internal class Program
 {
     static void Main()
     {
-        // 1. Инструмент без аргументов
-        HandlerMCP.CreateEmpty(GetTime, "GetTime", "Получить время сервера");
-
-        // 2. Инструмент с фиксированными свойствами
-        HandlerMCP.Create(Add, "Add", "Сложение двух чисел",
-            ("a", HandlerMCP.Types.Integer.Str()),
-            ("b", HandlerMCP.Types.Integer.Str())
-        );
-
-        // 3. Инструмент для работы со списками
-        HandlerMCP.CreateList(ProcessBatch, "Batch", "Обработка списка", "items",
-            ("id", HandlerMCP.Types.Integer.Str())
-        );
-
-        // Запуск сервера
+        // 1. Регистрируем инструменты
+        HandlerMCP.CreateEmpty(GetTime, "GetTime", "Текущее время");
+        HandlerMCP.Create(Add, "Add", "Сложить числа", 
+            ("a", HandlerMCP.Types.Integer.Str()), 
+            ("b", HandlerMCP.Types.Integer.Str()));
+        
+        // 2. Запускаем сервер (чтение из stdin, запись в stdout)
         HandlerMCP.Start(Console.OpenStandardInput());
     }
 
-    // 1. Успешный ответ (неявное приведение строки)
     static ToolResult GetTime(JsonElement id, JsonElement args) 
         => DateTime.Now.ToString("HH:mm:ss");
 
-    // 2. Пример возврата ошибки для нейросети (ToolResult.Error)
     static ToolResult Add(JsonElement id, JsonElement args)
     {
-        if (!args.TryGetProperty("a", out var aProp) || aProp.ValueKind != JsonValueKind.Number)
-            return ToolResult.Error("Параметр 'a' обязателен и должен быть числом.");
-
-        if (!args.TryGetProperty("b", out var bProp) || bProp.ValueKind != JsonValueKind.Number)
-            return ToolResult.Error("Параметр 'b' обязателен и должен быть числом.");
-
-        return (aProp.GetInt32() + bProp.GetInt32()).ToString();
-    }
-
-    // 3. Пример возврата ошибки протокола (ToolResult.ProtocolError)
-    static ToolResult ProcessBatch(JsonElement id, JsonElement args)
-    {
-        if (!args.TryGetProperty("items", out var items) || items.ValueKind != JsonValueKind.Array)
-            return ToolResult.ProtocolError("Неверный формат: отсутствует массив 'items'.");
-
-        int count = items.GetArrayLength();
-        if (count == 0)
-            return ToolResult.Error("Массив 'items' не может быть пустым.");
-
-        return $"Обработано элементов: {count}";
+        if (!args.TryGetProperty("a", out var a)) return ToolResult.Error("Нет параметра 'a'");
+        if (!args.TryGetProperty("b", out var b)) return ToolResult.Error("Нет параметра 'b'");
+        return (a.GetInt32() + b.GetInt32()).ToString();
     }
 }
 ```
 
-## Методы регистрации инструментов
+## Доступные методы
 
-Все инструменты регистрируются до вызова `HandlerMCP.Start()`.
+| Метод | Описание | Пример использования |
+|-------|----------|----------------------|
+| `CreateEmpty` | Инструмент без параметров | `GetTime`, `Ping` |
+| `Create` | Инструмент с фиксированными параметрами | `Add(a, b)`, `Search(query)` |
+| `CreateList` | Инструмент для обработки списков | `ProcessBatch(items)`, `Filter(ids)` |
 
-### CreateEmpty
-Регистрирует инструмент, не принимающий входных аргументов.
+## Типы данных
 
-```csharp
-HandlerMCP.CreateEmpty(ToolHandler handler, string name, string description);
-```
+Используйте `.Str()` для указания типов в регистрационных методах:
+- `HandlerMCP.Types.String.Str()` → `"string"`
+- `HandlerMCP.Types.Integer.Str()` → `"integer"`
+- `HandlerMCP.Types.Float.Str()` → `"float"`
+- `HandlerMCP.Types.Boolean.Str()` → `"boolean"`
+- `HandlerMCP.Types.Array.Str()` → `"array"`
 
-### Create
-Регистрирует инструмент с фиксированным набором свойств (ключ-значение).
+## Обработка результатов
 
-```csharp
-HandlerMCP.Create(ToolHandler handler, string name, string description, params (string propName, string type)[] props);
-```
+Ваша функция должна вернуть `ToolResult`:
 
-### CreateList
-Регистрирует инструмент, принимающий массив объектов в указанном свойстве.
+1. **Успех**: Верните строку (автоматически конвертируется).
+   ```csharp
+   return "Готово!";
+   ```
+2. **Логическая ошибка**: Верните `ToolResult.Error(...)`. LLM увидит сообщение и попробует исправить запрос.
+   ```csharp
+   return ToolResult.Error("Неверный формат даты.");
+   ```
+3. **Критическая ошибка**: Верните `ToolResult.ProtocolError(...)`. Это вызовет ошибку JSON-RPC.
+   ```csharp
+   return ToolResult.ProtocolError("База данных недоступна.");
+   ```
 
-```csharp
-HandlerMCP.CreateList(ToolHandler handler, string name, string description, string listPropertyName, params (string propName, string type)[] itemProps);
-```
+## Запуск
 
-## Типы данных (`HandlerMCP.Types`)
-
-Для построения типов аргументов в методах `Create` и `CreateList` используется метод расширения `.Str()`:
-
-* `HandlerMCP.Types.String.Str()` — `"string"`
-* `HandlerMCP.Types.Integer.Str()` — `"integer"`
-* `HandlerMCP.Types.Float.Str()` — `"float"`
-* `HandlerMCP.Types.Double.Str()` — `"double"`
-* `HandlerMCP.Types.Boolean.Str()` — `"boolean"`
-* `HandlerMCP.Types.Array.Str()` — `"array"`
-* `HandlerMCP.Types.Object.Str()` — `"object"`
-
-## Обработка результатов и ошибок (`ToolResult`)
-
-Делегат обработчика имеет сигнатуру:
-```csharp
-public delegate ToolResult ToolHandler(JsonElement id, JsonElement args);
-```
-
-Возвращаемое значение `ToolResult` поддерживает три сценария ответа:
-
-### 1. Успешное выполнение
-Возвращается обычная строка (автоматически приводится к `ToolResult`).
+Просто передайте поток ввода в метод `Start`:
 
 ```csharp
-return "Результат вычислений";
+HandlerMCP.Start(Console.OpenStandardInput());
 ```
 
-### 2. Ошибка исполнения инструмента (`ToolResult.Error`)
-Формирует ответ с флагом `isError: true`. Используется, когда аргументы неверны или логика не может быть выполнена. Нейросеть считывает этот текст и пытается скорректировать параметры при повторном вызове.
-
-```csharp
-return ToolResult.Error("Параметр 'a' должен быть целым числом.");
-```
-
-### 3. Ошибка протокола (`ToolResult.ProtocolError`)
-Формирует ответ ошибки JSON-RPC (`"error": { ... }`). Используется для вызова сбоя на стороне MCP-клиента.
-
-```csharp
-return ToolResult.ProtocolError("Критический сбой базы данных.");
-```
-
-Если внутри обработчика происходит необработанное исключение (`Exception`), сервер автоматически формирует ошибку протокола.
+Сервер автоматически начнёт читать команды из STDIN и писать ответы в STDOUT. Никаких дополнительных настроек транспорта.
