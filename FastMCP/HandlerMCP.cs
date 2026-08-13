@@ -13,6 +13,7 @@ public static partial class HandlerMCP
 {
     private static readonly Dictionary<string, (object Schema, ToolHandler Handler)> _tools = new();
     private static object[] _toolsList = Array.Empty<object>();
+
     private static readonly string[] typesString =
     [
         "string",
@@ -30,7 +31,10 @@ public static partial class HandlerMCP
     ];
 
     public static string Str(this Types t)
-        => typesString[(int)t];
+    {
+        int index = (int)t;
+        return (index >= 0 && index < typesString.Length) ? typesString[index] : t.ToString().ToLowerInvariant();
+    }
 
     public static void CreateEmpty(ToolHandler handler, string name, string desc)
         => _tools[name] = (new
@@ -43,6 +47,7 @@ public static partial class HandlerMCP
                 properties = new { }
             }
         }, handler);
+
     public static void Create(ToolHandler handler, string name, string desc, params (string propName, string type)[] props)
         => _tools[name] = (new
         {
@@ -55,6 +60,7 @@ public static partial class HandlerMCP
                 required = SelectToArray(props)
             }
         }, handler);
+
     public static void CreateList(ToolHandler handler, string name, string desc, string listPropertyName, params (string propName, string type)[] itemProps)
         => _tools[name] = (new
         {
@@ -88,16 +94,15 @@ public static partial class HandlerMCP
     private static string[] SelectToArray((string propName, string type)[] p)
         => p.Select(static p => p.propName).ToArray();
 
-    public static void Start(StreamReader reader) 
-        => Start(reader.BaseStream);
+    public static void Start(StreamReader reader) => Start(reader.BaseStream);
 
     public static void Start(Stream inputStream)
     {
         _toolsList = _tools.Values.Select(static t => t.Schema).ToArray();
 
-        using var stdout = Console.OpenStandardOutput();
-        using var writer = new Utf8JsonWriter(stdout, new JsonWriterOptions { Indented = false });
-        using var lineReader = new ByteLineReader(inputStream);
+        using Stream stdout = Console.OpenStandardOutput();
+        using Utf8JsonWriter writer = new Utf8JsonWriter(stdout, new JsonWriterOptions { Indented = false });
+        using ByteLineReader lineReader = new ByteLineReader(inputStream);
 
     Beginning:
         if (!lineReader.TryReadLine(out ReadOnlySpan<byte> lineSpan))
@@ -112,28 +117,33 @@ public static partial class HandlerMCP
         if (cleanLine.IsEmpty)
             goto Beginning;
 
-        // Передаем stdout в обработчик
         ProcessRequestSpan(cleanLine, writer, stdout);
-
         goto Beginning;
     }
 
     private static void ProcessRequestSpan(ReadOnlySpan<byte> jsonBytes, Utf8JsonWriter writer, Stream stdout)
     {
         writer.Reset(stdout);
-
         JsonElement id = default;
+
         try
         {
-            var reader = new Utf8JsonReader(jsonBytes);
-            using var doc = JsonDocument.ParseValue(ref reader);
+            Utf8JsonReader reader = new Utf8JsonReader(jsonBytes);
+            using JsonDocument doc = JsonDocument.ParseValue(ref reader);
             JsonElement root = doc.RootElement;
 
-            if (!root.TryGetProperty("id"u8, out id) || id.ValueKind is JsonValueKind.Undefined)
+            // Вынесенная валидация запроса
+            if (!ValidateRequest(root, out id, out JsonElement methodEl, out string errorMessage))
+            {
+                if (!string.IsNullOrEmpty(errorMessage))
+                {
+                    WriteErrorResponse(writer, id, errorMessage, -32600);
+                    writer.Flush();
+                    stdout.WriteByte((byte)'\n');
+                    stdout.Flush();
+                }
                 return;
-
-            if (!root.TryGetProperty("method"u8, out JsonElement methodEl))
-                return;
+            }
 
             if (methodEl.ValueEquals("initialize"u8))
                 WriteInitializeResponse(writer, id);
@@ -145,7 +155,9 @@ public static partial class HandlerMCP
                 ToolsCall(id, paramsEl, writer);
             }
             else
+            {
                 WriteErrorResponse(writer, id, "Метод не найден.", -32601);
+            }
 
             writer.Flush();
             stdout.WriteByte((byte)'\n');
@@ -154,25 +166,72 @@ public static partial class HandlerMCP
         catch (Exception ex)
         {
             writer.Reset(stdout);
-            WriteErrorResponse(writer, id, ex.Message, -32602);
+            WriteErrorResponse(writer, id, $"Ошибка синтаксиса JSON: {ex.Message}", -32700);
             writer.Flush();
             stdout.WriteByte((byte)'\n');
             stdout.Flush();
         }
     }
 
+    private static bool ValidateRequest(JsonElement root, out JsonElement id, out JsonElement methodEl, out string errorMessage)
+    {
+        id = default;
+        methodEl = default;
+
+        if (root.ValueKind is not JsonValueKind.Object)
+        {
+            errorMessage = "Некорректный запрос: корневой элемент должен быть JSON-объектом.";
+            return false;
+        }
+
+        if (!root.TryGetProperty("jsonrpc"u8, out JsonElement jsonrpc) || !jsonrpc.ValueEquals("2.0"u8))
+        {
+            errorMessage = "Некорректный запрос: отсутствует или неверная версия 'jsonrpc' (ожидается '2.0').";
+            return false;
+        }
+
+        bool hasId = root.TryGetProperty("id"u8, out id);
+
+        if (!root.TryGetProperty("method"u8, out methodEl) || methodEl.ValueKind != JsonValueKind.String)
+        {
+            if (hasId)
+            {
+                errorMessage = "Некорректный запрос: отсутствует или неверное имя метода.";
+                return false;
+            }
+
+            errorMessage = string.Empty;
+            return false;
+        }
+
+        if (!hasId)
+        {
+            errorMessage = string.Empty;
+            return false;
+        }
+
+        if (id.ValueKind is not (JsonValueKind.String or JsonValueKind.Number or JsonValueKind.Null))
+        {
+            errorMessage = "Некорректный запрос: 'id' должен быть строкой, числом или null.";
+            return false;
+        }
+
+        errorMessage = string.Empty;
+        return true;
+    }
+
     private static void ToolsCall(JsonElement id, JsonElement paramsEl, Utf8JsonWriter writer)
     {
-        if (paramsEl.ValueKind is not JsonValueKind.Object || !paramsEl.TryGetProperty("name"u8, out var toolNameElement))
+        if (paramsEl.ValueKind is not JsonValueKind.Object || !paramsEl.TryGetProperty("name"u8, out JsonElement toolNameElement))
         {
             WriteErrorResponse(writer, id, "Нет названия инструмента.");
             return;
         }
 
         string? toolName = toolNameElement.GetString();
-        if (toolName is null || !_tools.TryGetValue(toolName, out var tool))
+        if (toolName is null || !_tools.TryGetValue(toolName, out (object Schema, ToolHandler Handler) tool))
         {
-            WriteErrorResponse(writer, id, $"Unknown tool: {toolName}");
+            WriteErrorResponse(writer, id, $"Неизвестный инструмент: {toolName}");
             return;
         }
 
@@ -183,9 +242,9 @@ public static partial class HandlerMCP
             ToolResult result = tool.Handler(id, args);
 
             if (result.IsProtocolError)
-                WriteErrorResponse(writer, id, result.Text); // Отправляем жесткую ошибку JSON-RPC
+                WriteErrorResponse(writer, id, result.Text);
             else
-                WriteToolResponse(writer, id, result); // Отправляем стандартный ответ
+                WriteToolResponse(writer, id, result);
         }
         catch (Exception ex)
         {
@@ -193,12 +252,20 @@ public static partial class HandlerMCP
         }
     }
 
+    private static void WriteId(Utf8JsonWriter writer, JsonElement id)
+    {
+        writer.WritePropertyName("id"u8);
+        if (id.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null)
+            writer.WriteNullValue();
+        else
+            id.WriteTo(writer);
+    }
+
     private static void WriteToolResponse(Utf8JsonWriter writer, JsonElement id, ToolResult result)
     {
         writer.WriteStartObject();
         writer.WriteString("jsonrpc"u8, "2.0"u8);
-        writer.WritePropertyName("id"u8);
-        id.WriteTo(writer);
+        WriteId(writer, id);
 
         writer.WritePropertyName("result"u8);
         writer.WriteStartObject();
@@ -209,40 +276,7 @@ public static partial class HandlerMCP
         writer.WriteString("text"u8, result.Text);
         writer.WriteEndObject();
         writer.WriteEndArray();
-
-        // Динамический флаг ошибки
         writer.WriteBoolean("isError"u8, result.IsError);
-
-        writer.WriteEndObject();
-        writer.WriteEndObject();
-    }
-
-    private static ReadOnlySpan<byte> CleanSpan(ReadOnlySpan<byte> span)
-    {
-        while (span.Length > 0 && (span[0] == (byte)'\r' || span[0] == (byte)'\n' || span[0] == (byte)' ' || span[0] == (byte)'\0' || span[0] == (byte)'\t'))
-            span = span.Slice(1);
-        while (span.Length > 0 && (span[^1] == (byte)'\r' || span[^1] == (byte)'\n' || span[^1] == (byte)' ' || span[^1] == (byte)'\0' || span[^1] == (byte)'\t'))
-            span = span.Slice(0, span.Length - 1);
-        return span;
-    }
-
-    private static void WriteSuccessResponse(Utf8JsonWriter writer, JsonElement id, string text)
-    {
-        writer.WriteStartObject();
-        writer.WriteString("jsonrpc"u8, "2.0"u8);
-        writer.WritePropertyName("id"u8);
-        id.WriteTo(writer);
-
-        writer.WritePropertyName("result"u8);
-        writer.WriteStartObject();
-        writer.WritePropertyName("content"u8);
-        writer.WriteStartArray();
-        writer.WriteStartObject();
-        writer.WriteString("type"u8, "text"u8);
-        writer.WriteString("text"u8, text);
-        writer.WriteEndObject();
-        writer.WriteEndArray();
-        writer.WriteBoolean("isError"u8, false);
         writer.WriteEndObject();
         writer.WriteEndObject();
     }
@@ -251,11 +285,7 @@ public static partial class HandlerMCP
     {
         writer.WriteStartObject();
         writer.WriteString("jsonrpc"u8, "2.0"u8);
-        writer.WritePropertyName("id"u8);
-        if (id.ValueKind is JsonValueKind.Undefined)
-            writer.WriteNullValue();
-        else
-            id.WriteTo(writer);
+        WriteId(writer, id);
 
         writer.WritePropertyName("error"u8);
         writer.WriteStartObject();
@@ -269,8 +299,7 @@ public static partial class HandlerMCP
     {
         writer.WriteStartObject();
         writer.WriteString("jsonrpc"u8, "2.0"u8);
-        writer.WritePropertyName("id"u8);
-        id.WriteTo(writer);
+        WriteId(writer, id);
         writer.WritePropertyName("result"u8);
         writer.WriteStartObject();
         writer.WriteString("protocolVersion"u8, "2024-11-05"u8);
@@ -293,8 +322,7 @@ public static partial class HandlerMCP
     {
         writer.WriteStartObject();
         writer.WriteString("jsonrpc"u8, "2.0"u8);
-        writer.WritePropertyName("id"u8);
-        id.WriteTo(writer);
+        WriteId(writer, id);
         writer.WritePropertyName("result"u8);
         writer.WriteStartObject();
         writer.WritePropertyName("tools"u8);
@@ -303,8 +331,16 @@ public static partial class HandlerMCP
         writer.WriteEndObject();
     }
 
-    
+    private static ReadOnlySpan<byte> CleanSpan(ReadOnlySpan<byte> span)
+    {
+        while (span.Length > 0 && (span[0] == (byte)'\r' || span[0] == (byte)'\n' || span[0] == (byte)' ' || span[0] == (byte)'\0' || span[0] == (byte)'\t'))
+            span = span.Slice(1);
+        while (span.Length > 0 && (span[^1] == (byte)'\r' || span[^1] == (byte)'\n' || span[^1] == (byte)' ' || span[^1] == (byte)'\0' || span[^1] == (byte)'\t'))
+            span = span.Slice(0, span.Length - 1);
+        return span;
+    }
 }
+
 partial class HandlerMCP
 {
 
@@ -329,14 +365,17 @@ partial class HandlerMCP
         private readonly Stream _stream;
         private byte[]? _buffer;
         private int _bufferOffset;
+        private int _consumedBytes;
 
         public bool HasMoreData;
+        private const int MaxLineLength = 2 * 1024 * 1024; // Лимит 2 МБ на строку для защиты от OOM
 
         public ByteLineReader(Stream stream)
         {
             _stream = stream;
             _buffer = ArrayPool<byte>.Shared.Rent(8192);
             _bufferOffset = 0;
+            _consumedBytes = 0;
             HasMoreData = true;
         }
 
@@ -348,19 +387,37 @@ partial class HandlerMCP
                 return false;
             }
 
+            // Сдвигаем буфер ТОЛЬКО ПРИ СЛЕДУЮЩЕМ ВЫЗОВЕ, чтобы не испортить предыдущий lineSpan
+            if (_consumedBytes > 0)
+            {
+                int remaining = _bufferOffset - _consumedBytes;
+                if (remaining > 0)
+                {
+                    _buffer.AsSpan(_consumedBytes, remaining).CopyTo(_buffer);
+                }
+                _bufferOffset = remaining;
+                _consumedBytes = 0;
+            }
+
             ReadOnlySpan<byte> currentSpan = _buffer.AsSpan(0, _bufferOffset);
             int newLineIndex = currentSpan.IndexOf((byte)'\n');
 
             if (newLineIndex >= 0)
             {
                 lineSpan = currentSpan.Slice(0, newLineIndex);
-                ShiftBuffer(newLineIndex + 1);
+                _consumedBytes = newLineIndex + 1;
                 return true;
+            }
+
+            if (_buffer.Length >= MaxLineLength)
+            {
+                throw new InvalidOperationException($"Превышен максимальный размер строки ({MaxLineLength} байт).");
             }
 
             if (_bufferOffset == _buffer.Length)
             {
-                byte[] newBuffer = ArrayPool<byte>.Shared.Rent(_buffer.Length * 2);
+                int newSize = Math.Min(_buffer.Length * 2, MaxLineLength);
+                byte[] newBuffer = ArrayPool<byte>.Shared.Rent(newSize);
                 _buffer.AsSpan(0, _bufferOffset).CopyTo(newBuffer);
                 ArrayPool<byte>.Shared.Return(_buffer);
                 _buffer = newBuffer;
@@ -373,7 +430,7 @@ partial class HandlerMCP
                 if (_bufferOffset > 0)
                 {
                     lineSpan = _buffer.AsSpan(0, _bufferOffset);
-                    _bufferOffset = 0;
+                    _consumedBytes = _bufferOffset;
                     return true;
                 }
 
@@ -389,20 +446,12 @@ partial class HandlerMCP
             if (newLineIndex >= 0)
             {
                 lineSpan = currentSpan.Slice(0, newLineIndex);
-                ShiftBuffer(newLineIndex + 1);
+                _consumedBytes = newLineIndex + 1;
                 return true;
             }
 
             lineSpan = default;
             return false;
-        }
-
-        private void ShiftBuffer(int consumedBytes)
-        {
-            int remaining = _bufferOffset - consumedBytes;
-            if (remaining > 0)
-                _buffer.AsSpan(consumedBytes, remaining).CopyTo(_buffer);
-            _bufferOffset = remaining;
         }
 
         public void Dispose()
